@@ -1,0 +1,115 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/quantum/cuda-quantum:cu12-0.10.0
+
+%labels
+    Author  satyumm
+    Version v1.10
+
+###########################################################################
+# 1. System packages, CUDA Toolkit & MPI build dependencies
+###########################################################################
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Purge IB/RDMA libs
+    apt-get remove -y --purge 'libibverbs*' 'ibverbs-providers' || true
+    sed -i '/mellanox/d;/mlnx/d' /etc/apt/sources.list || true
+    find /etc/apt/sources.list.d -type f \
+         \( -name '*mellanox*' -o -name '*mlnx*' \) -delete
+
+    # Install core tooling + Python3-pip + CUDA Toolkit 12.8
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git wget curl ca-certificates \
+        openssh-server python3-dev python3-pip \
+        libtool autoconf automake gfortran pkg-config \
+        tar bzip2 cuda-toolkit-12-8
+
+    # Symlink CUDA so tools find libcudart under /usr/local/cuda
+    ln -sfn /usr/local/cuda-12.8 /usr/local/cuda
+
+###########################################################################
+# 2. OpenMPI (for C++ multi-GPU)
+###########################################################################
+    OMPI_VERSION=4.1.5
+    mkdir -p /tmp/ompi-src && cd /tmp/ompi-src
+    wget https://download.open-mpi.org/release/open-mpi/v4.1/openmpi-${OMPI_VERSION}.tar.bz2
+    tar -xjf openmpi-${OMPI_VERSION}.tar.bz2
+    cd openmpi-${OMPI_VERSION}
+    ./configure --prefix=/opt/ompi
+    make -j"$(nproc)" install
+
+    export PATH=/opt/ompi/bin:$PATH
+    export LD_LIBRARY_PATH=/opt/ompi/lib:$LD_LIBRARY_PATH
+
+###########################################################################
+# 3. Build CUDA-Quantum MPI plugin (C++)
+###########################################################################
+    export CUDA_QUANTUM_PATH=/opt/nvidia/cudaq
+    cd "${CUDA_QUANTUM_PATH}/distributed_interfaces"
+    export CXXFLAGS="-I${CUDA_QUANTUM_PATH}/runtime/cudaq/distributed ${CXXFLAGS:-}"
+    bash activate_custom_mpi.sh
+    mkdir -p "${CUDA_QUANTUM_PATH}/lib"
+    cp libcudaq_distributed_interface_mpi.so "${CUDA_QUANTUM_PATH}/lib/"
+
+###########################################################################
+# 4. Python Package Installation (pip)
+###########################################################################
+    python3 -m pip install --upgrade pip
+    python3 -m pip install --no-cache-dir \
+      --extra-index-url https://pypi.nvidia.com \
+      cudaq mpi4py
+
+###########################################################################
+# 5. Miniconda (so you can later `conda create` & `conda activate`)
+###########################################################################
+    wget -qO /tmp/miniconda.sh \
+       https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+    bash /tmp/miniconda.sh -b -p /opt/conda
+    rm /tmp/miniconda.sh
+
+###########################################################################
+# 6. Cleanup
+###########################################################################
+    apt-get clean
+    rm -rf /var/lib/apt/lists/* /tmp/ompi-src
+
+###########################################################################
+# 7. Runtime environment (Conda present but not auto-activated)
+###########################################################################
+%environment
+    # CUDA-Quantum path
+    export CUDA_QUANTUM_PATH=/opt/nvid# ia/cudaq
+
+    # Put nvq++, mpiexec, nvcc, python3, conda on PATH
+    export PATH=/opt/ompi/bin:/usr/local/cuda/bin:/opt/conda/bin:$PATH
+
+    # Shared libraries: OpenMPI, CUDA, CUDA-Quantum
+    export LD_LIBRARY_PATH=/opt/ompi/lib:/usr/local/cuda/lib64:\
+/opt/nvidia/cudaq/lib:$LD_LIBRARY_PATH
+
+    # Source CUDA-Quantum’s own env script
+    . /opt/nvidia/cudaq/set_env.sh
+
+    # MPI plugin for Python/C++ multi-GPU
+    export CUDAQ_MPI_COMM_LIB=${CUDA_QUANTUM_PATH}/lib/\
+libcudaq_distributed_interface_mpi.so
+    export OMPI_MCA_opal_cuda_support=true
+    export OMPI_MCA_btl='^openib'
+
+###########################################################################
+# 8. Default run: drop you into a shell with conda available
+###########################################################################
+%runscript
+    exec bash -l -c "echo 'Container ready — Conda is installed at /opt/conda'; bash"
+
+###########################################################################
+# 9. Automated tests (build-time, pip only)
+###########################################################################
+%test
+    g++ --version      || exit 1
+    mpiexec --version  || exit 1
+    nvq++ --version    || exit 1
+    python3 -c "import cudaq" || exit 1
+    ls /usr/local/cuda/lib64/libcudart.so* || exit 1
+    echo "TEST PASSED: All components are present and functional 
